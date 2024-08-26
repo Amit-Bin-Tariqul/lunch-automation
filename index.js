@@ -31,7 +31,7 @@ async function readSpreadsheet() {
   const sheetsClient = await auth.getClient();
   const googleSheets = google.sheets({ version: "v4", auth: sheetsClient });
 
-  const spreadsheetId = process.env.SPREADSHEET_ID;
+  const spreadsheetId = process.env.SPREADSHEET_ID; // Use the spreadsheetId from .env
 
   // Read rows from Sheet1
   const getRows = await googleSheets.spreadsheets.values.get({
@@ -53,7 +53,7 @@ async function readSpreadsheet() {
 function isBeforeCutoffTime() {
   const now = new Date();
   const cutoffTime = new Date();
-  cutoffTime.setHours(9, 0, 0, 0); // Set to 9:00 AM
+  cutoffTime.setHours(19, 0, 0, 0); // Set to 9:00 AM
 
   return now < cutoffTime;
 }
@@ -61,7 +61,15 @@ function isBeforeCutoffTime() {
 // Function to create the poll
 async function createPoll(message) {
   if (pollMessage) {
-    await pollMessage.delete(); // Delete the previous poll message if it exists
+    try {
+      await pollMessage.delete(); // Attempt to delete the previous poll message if it exists
+    } catch (error) {
+      if (error.code === 10008) { // Code 10008 corresponds to "Unknown Message"
+        console.log("The previous poll message was already deleted by a user.");
+      } else {
+        console.error("An unexpected error occurred while deleting the previous poll message:", error);
+      }
+    }
   }
 
   if (menuItems.length === 0) {
@@ -101,6 +109,8 @@ async function updateVoteInSheet(userId, userName, itemName) {
 
   const sheetsClient = await auth.getClient();
   const googleSheets = google.sheets({ version: "v4", auth: sheetsClient });
+
+  const spreadsheetId = process.env.SPREADSHEET_ID; // Use the spreadsheetId from .env
 
   try {
     // Check if the user has already voted
