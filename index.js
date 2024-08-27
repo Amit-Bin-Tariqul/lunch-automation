@@ -16,58 +16,143 @@ const client = new Client({
   ],
 });
 
+
+// Replace with your channel ID
+const TARGET_CHANNEL_ID = process.env.CHANNEL_ID; 
+
+
 let menuItems = [];
 let pollMessage = null;
-let votes = {}; // To track votes for each item
-let userVotes = {}; // To track who has voted
+let votes = {};
+let userVotes = {};
+
+// Google Sheets authentication
+const auth = new google.auth.GoogleAuth({
+  keyFile: "credentials.json", // Path to your credentials file
+  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+});
+
+const sheets = google.sheets({ version: "v4", auth });
 
 // Function to read items from the spreadsheet (Sheet1)
 async function readSpreadsheet() {
-  const auth = new google.auth.GoogleAuth({
-    keyFile: "credentials.json",
-    scopes: "https://www.googleapis.com/auth/spreadsheets",
-  });
+  try {
+    const getRows = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.SPREADSHEET_ID,
+      range: "Sheet1!A:B",
+    });
 
-  const sheetsClient = await auth.getClient();
-  const googleSheets = google.sheets({ version: "v4", auth: sheetsClient });
-
-  const spreadsheetId = process.env.SPREADSHEET_ID; // Use the spreadsheetId from .env
-
-  // Read rows from Sheet1
-  const getRows = await googleSheets.spreadsheets.values.get({
-    auth,
-    spreadsheetId,
-    range: "Sheet1!A:B", // Adjust the range if needed
-  });
-
-  const rows = getRows.data.values;
-  if (rows.length) {
-    menuItems = rows.slice(1); // Remove header row
-    console.log("Menu items updated:", menuItems);
-  } else {
-    console.log("No data found.");
+    const rows = getRows.data.values;
+    if (rows && rows.length) {
+      menuItems = rows.slice(1);
+      console.log("Menu items updated:", menuItems);
+    } else {
+      console.log("No data found.");
+    }
+  } catch (error) {
+    console.error("Error reading spreadsheet:", error);
   }
 }
 
-// Function to check if the current time is before 9:00 AM
-function isBeforeCutoffTime() {
-  const now = new Date();
-  const cutoffTime = new Date();
-  cutoffTime.setHours(19, 0, 0, 0); // Set to 9:00 AM
+// Function to get the current date in the format dd/mm/yyyy
+function getCurrentDateFormatted(date = new Date()) {
+  const day = String(date.getDate()).padStart(2, "0");
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const year = String(date.getFullYear()).slice(2); // Get last two digits of the year
 
-  return now < cutoffTime;
+  return `${day}/${month}/${year}`;
+}
+
+// Function to create a new sheet with the current date as the title
+async function createSheetIfNotExists(dateFormatted) {
+  try {
+    const getSheets = await sheets.spreadsheets.get({
+      spreadsheetId: process.env.SPREADSHEET_ID,
+    });
+
+    const sheetExists = getSheets.data.sheets.some(
+      (sheet) => sheet.properties.title === dateFormatted
+    );
+
+    if (!sheetExists) {
+      const addSheetResponse = await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: process.env.SPREADSHEET_ID,
+        resource: {
+          requests: [
+            {
+              addSheet: {
+                properties: {
+                  title: dateFormatted,
+                },
+              },
+            },
+          ],
+        },
+      });
+
+      const sheetId =
+        addSheetResponse.data.replies[0].addSheet.properties.sheetId;
+
+      // Add column headers to the new sheet
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: process.env.SPREADSHEET_ID,
+        range: `${dateFormatted}!A1:D1`,
+        valueInputOption: "USER_ENTERED",
+        resource: {
+          values: [["User ID", "Timestamp", "Username", "Item Voted"]],
+        },
+      });
+
+      // Apply bold formatting to the headers
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: process.env.SPREADSHEET_ID,
+        resource: {
+          requests: [
+            {
+              repeatCell: {
+                range: {
+                  sheetId: sheetId,
+                  startRowIndex: 0,
+                  endRowIndex: 1,
+                },
+                cell: {
+                  userEnteredFormat: {
+                    textFormat: {
+                      bold: true,
+                    },
+                  },
+                },
+                fields: "userEnteredFormat.textFormat.bold",
+              },
+            },
+          ],
+        },
+      });
+
+      console.log(`Created sheet: ${dateFormatted} with bold headers`);
+    } else {
+      console.log(`Sheet ${dateFormatted} already exists`);
+    }
+
+    return dateFormatted;
+  } catch (error) {
+    console.error("Error creating sheet:", error);
+  }
 }
 
 // Function to create the poll
 async function createPoll(message) {
   if (pollMessage) {
     try {
-      await pollMessage.delete(); // Attempt to delete the previous poll message if it exists
+      await pollMessage.delete();
     } catch (error) {
-      if (error.code === 10008) { // Code 10008 corresponds to "Unknown Message"
+      if (error.code === 10008) {
         console.log("The previous poll message was already deleted by a user.");
       } else {
-        console.error("An unexpected error occurred while deleting the previous poll message:", error);
+        console.error(
+          "An unexpected error occurred while deleting the previous poll message:",
+          error
+        );
       }
     }
   }
@@ -80,11 +165,11 @@ async function createPoll(message) {
   const row = new ActionRowBuilder();
 
   menuItems.forEach((item, index) => {
-    votes[`item_${index}`] = 0; // Initialize vote count
+    votes[`item_${index}`] = 0;
     row.addComponents(
       new ButtonBuilder()
         .setCustomId(`item_${index}`)
-        .setLabel(item[1]) // Item name
+        .setLabel(item[1])
         .setStyle(ButtonStyle.Primary)
     );
   });
@@ -95,70 +180,96 @@ async function createPoll(message) {
   });
 }
 
-// Function to update the vote in Sheet2
-async function updateVoteInSheet(userId, userName, itemName) {
-  if (!isBeforeCutoffTime()) {
-    console.log("Voting is closed. No more updates allowed.");
+// Function to update or append the vote in the sheet
+async function updateOrAppendVote(interaction, userId, userName, itemName) {
+  const now = new Date(); // Always represents the current date/time
+  const currentDate = getCurrentDateFormatted(now);
+  const tomorrow = new Date(now); // Create a copy of the current date
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const tomorrowDate = getCurrentDateFormatted(tomorrow);
+
+  const startTime = "18:00:00";
+  const endTime = "20:00:00";
+
+  const startDate = new Date(now);
+  startDate.setHours(startTime.split(":")[0]);
+  startDate.setMinutes(startTime.split(":")[1]);
+  startDate.setSeconds(startTime.split(":")[2]);
+
+  const endDate = new Date(now);
+  endDate.setHours(endTime.split(":")[0]);
+  endDate.setMinutes(endTime.split(":")[1]);
+  endDate.setSeconds(endTime.split(":")[2]);
+
+  let sheetName;
+
+
+  console.log(now, "\n", startDate, "\n", endDate);
+
+  if (now < startDate) {
+    // If current time is before 9:00 AM, update today's sheet
+    sheetName = await createSheetIfNotExists(currentDate);
+  } else if (now > endDate) {
+    // If current time is after 7:00 PM, update tomorrow's sheet
+    sheetName = await createSheetIfNotExists(tomorrowDate);
+  } else {
+    // If current time is between 9:00 AM and 7:00 PM, disallow voting
+    console.log(`Voting timestamp between 9 AM and 7 PM; voting not allowed.`);
+    await interaction.editReply({
+      content: `Sorry!! Restaurant is closed for today. Please place order within 3:00 PM to 9:00 AM`,
+    });
     return;
   }
 
-  const auth = new google.auth.GoogleAuth({
-    keyFile: "credentials.json",
-    scopes: "https://www.googleapis.com/auth/spreadsheets",
-  });
-
-  const sheetsClient = await auth.getClient();
-  const googleSheets = google.sheets({ version: "v4", auth: sheetsClient });
-
-  const spreadsheetId = process.env.SPREADSHEET_ID; // Use the spreadsheetId from .env
+  const timestamp = now.toTimeString().split(" ")[0]; // Format: HH:MM:SS
 
   try {
-    // Check if the user has already voted
-    const getRows = await googleSheets.spreadsheets.values.get({
-      auth,
-      spreadsheetId,
-      range: "Sheet2!A:C", // Adjust the range if needed
+    const getRows = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.SPREADSHEET_ID,
+      range: `${sheetName}!A:D`,
     });
 
-    const rows = getRows.data.values || []; // Handle case where rows are undefined
+    const rows = getRows.data.values || [];
 
     let userFound = false;
     let rowIndex;
 
-    for (let i = 1; i < rows.length; i++) {
-      // Start at 1 to skip header row
-      if (rows[i][0] === userId) {
-        userFound = true;
-        rowIndex = i + 1; // +1 because row index in API is 1-based
-        break;
+    if (rows.length > 1) {
+      for (let i = 1; i < rows.length; i++) {
+        if (rows[i][0] === userId) {
+          userFound = true;
+          rowIndex = i + 1;
+          break;
+        }
       }
     }
 
     if (userFound) {
-      // Update the existing row with the new choice
-      await googleSheets.spreadsheets.values.update({
-        auth,
-        spreadsheetId,
-        range: `Sheet2!B${rowIndex}:C${rowIndex}`,
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: process.env.SPREADSHEET_ID,
+        range: `${sheetName}!B${rowIndex}:D${rowIndex}`,
         valueInputOption: "USER_ENTERED",
         resource: {
-          values: [[userName, itemName]],
+          values: [[timestamp, userName, itemName]],
         },
       });
+      console.log(`Updated existing vote for UserID: ${userId}`);
     } else {
-      // Append the new vote
-      await googleSheets.spreadsheets.values.append({
-        auth,
-        spreadsheetId,
-        range: "Sheet2!A:C",
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: process.env.SPREADSHEET_ID,
+        range: `${sheetName}!A:D`,
         valueInputOption: "USER_ENTERED",
         resource: {
-          values: [[userId, userName, itemName]],
+          values: [[userId, timestamp, userName, itemName]],
         },
       });
+      console.log(`Appended new vote for UserID: ${userId}`);
     }
+
+    // Only send "Noted" message if the vote was recorded
+    await interaction.editReply({ content: `Noted` });
   } catch (error) {
-    console.error("Error updating vote in sheet:", error);
+    console.error("Error updating or appending vote:", error);
   }
 }
 
@@ -169,8 +280,20 @@ client.once("ready", () => {
 
 // Handle text-based commands
 client.on("messageCreate", async (message) => {
+  
+  // Ignore bot's own messages
+  if (message.author.bot) return;
+
+  // Check if the message starts with "!" (indicating a bot command)
+  if (message.content.startsWith("!")) {
+    // Check if the message is in the designated channel
+    if (message.channel.id !== TARGET_CHANNEL_ID) {
+      await message.channel.send("Please give bot commands in the lunch channel.");
+      return;
+    }
+  }
+
   if (message.content.toLowerCase() === "!menu") {
-    // Read the spreadsheet and create a new poll every time the command is used
     await readSpreadsheet();
     await createPoll(message);
   }
@@ -186,24 +309,13 @@ client.on("interactionCreate", async (interaction) => {
   const itemIndex = parseInt(buttonId.split("_")[1]);
   const itemName = menuItems[itemIndex][1];
 
-  if (!isBeforeCutoffTime()) {
-    // Acknowledge the button click with a message that voting is closed
-    await interaction.reply({ content: `Voting is closed for today.`, ephemeral: true });
-    return;
-  }
+  // Defer the reply to give you more time
+  await interaction.deferReply({ ephemeral: true });
 
-  if (userVotes[userId]) {
-    // User has already voted, update their vote
-    await updateVoteInSheet(userId, userName, itemName);
-  } else {
-    // First-time vote, register it
-    userVotes[userId] = buttonId; // Record the user's vote
-    votes[buttonId] += 1;
-    await updateVoteInSheet(userId, userName, itemName);
-  }
+  await updateOrAppendVote(interaction, userId, userName, itemName);
 
-  // Acknowledge the button click
-  await interaction.reply({ content: `Noted`, ephemeral: true });
+  // Removed interaction.editReply from here
 });
+
 
 client.login(process.env.DISCORD_BOT_TOKEN);
