@@ -20,11 +20,17 @@ const client = new Client({
 // Replace with your channel ID
 const TARGET_CHANNEL_ID = process.env.CHANNEL_ID; 
 
+const startTime = "9:00:00";
+const endTime = "15:00:00";
+
+
 
 let menuItems = [];
 let pollMessage = null;
 let votes = {};
 let userVotes = {};
+
+
 
 // Google Sheets authentication
 const auth = new google.auth.GoogleAuth({
@@ -180,6 +186,85 @@ async function createPoll(message) {
   });
 }
 
+
+async function cancelOrder(message) {
+  const userId = message.author.id;
+  const userName = message.author.username;
+  const now = new Date();
+  const currentDate = getCurrentDateFormatted(now);
+
+  // Calculate which sheet to use based on the current time
+  const startDate = new Date(now);
+  startDate.setHours(startTime.split(":")[0]);
+  startDate.setMinutes(startTime.split(":")[1]);
+  startDate.setSeconds(startTime.split(":")[2]);
+
+  const endDate = new Date(now);
+  endDate.setHours(endTime.split(":")[0]);
+  endDate.setMinutes(endTime.split(":")[1]);
+  endDate.setSeconds(endTime.split(":")[2]);
+
+  let sheetName;
+  
+  if (now < startDate) {
+    sheetName = currentDate;
+  } else if (now > endDate) {
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    sheetName = getCurrentDateFormatted(tomorrow);
+  } else {
+    await message.reply("Cannot cancel between 9:00 AM and 3:00 PM.");
+    return;
+  }
+
+  try {
+    const getRows = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.SPREADSHEET_ID,
+      range: `${sheetName}!A:D`,
+    });
+
+    const rows = getRows.data.values;
+
+    if (!rows || rows.length === 0) {
+      await message.reply("No orders found to cancel.");
+      return;
+    }
+
+    const rowIndex = rows.findIndex(row => row[0] === userId);
+
+    if (rowIndex === -1) {
+      await message.reply("You have not placed an order yet.");
+    } else {
+      rows.splice(rowIndex, 1); // Remove the matching row
+      
+      // Clear the current sheet
+      await sheets.spreadsheets.values.clear({
+        spreadsheetId: process.env.SPREADSHEET_ID,
+        range: `${sheetName}!A:D`,
+      });
+
+      // Update the sheet with the modified data
+      if (rows.length > 0) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: process.env.SPREADSHEET_ID,
+          range: `${sheetName}!A1`,
+          valueInputOption: "RAW",
+          resource: {
+            values: rows,
+          },
+        });
+      }
+      
+      await message.reply("Your order has been canceled.");
+    }
+  } catch (error) {
+    console.error("Error canceling order:", error);
+    await message.reply("An error occurred while attempting to cancel your order.");
+  }
+}
+
+
+
 // Function to update or append the vote in the sheet
 async function updateOrAppendVote(interaction, userId, userName, itemName) {
   const now = new Date(); // Always represents the current date/time
@@ -188,8 +273,7 @@ async function updateOrAppendVote(interaction, userId, userName, itemName) {
   tomorrow.setDate(tomorrow.getDate() + 1);
   const tomorrowDate = getCurrentDateFormatted(tomorrow);
 
-  const startTime = "18:00:00";
-  const endTime = "20:00:00";
+  
 
   const startDate = new Date(now);
   startDate.setHours(startTime.split(":")[0]);
@@ -213,8 +297,8 @@ async function updateOrAppendVote(interaction, userId, userName, itemName) {
     // If current time is after 7:00 PM, update tomorrow's sheet
     sheetName = await createSheetIfNotExists(tomorrowDate);
   } else {
-    // If current time is between 9:00 AM and 7:00 PM, disallow voting
-    console.log(`Voting timestamp between 9 AM and 7 PM; voting not allowed.`);
+    // If current time is between 9:00 AM and 3:00 PM, disallow voting
+    console.log(`Voting timestamp between 9 AM and 3 PM; voting not allowed.`);
     await interaction.editReply({
       content: `Sorry!! Restaurant is closed for today. Please place order within 3:00 PM to 9:00 AM`,
     });
@@ -284,7 +368,7 @@ client.on("messageCreate", async (message) => {
   // Ignore bot's own messages
   if (message.author.bot) return;
 
-  // Check if the message starts with "!" (indicating a bot command)
+  // Check bot command with ! at start
   if (message.content.startsWith("!")) {
     // Check if the message is in the designated channel
     if (message.channel.id !== TARGET_CHANNEL_ID) {
@@ -297,6 +381,12 @@ client.on("messageCreate", async (message) => {
     await readSpreadsheet();
     await createPoll(message);
   }
+
+
+  if (message.content.toLowerCase() === "!cancel") {
+    await cancelOrder(message);
+  }
+
 });
 
 // Handle button clicks for voting
@@ -314,7 +404,6 @@ client.on("interactionCreate", async (interaction) => {
 
   await updateOrAppendVote(interaction, userId, userName, itemName);
 
-  // Removed interaction.editReply from here
 });
 
 
