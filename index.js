@@ -13,6 +13,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
   ],
 });
 
@@ -20,17 +21,15 @@ const client = new Client({
 // Replace with your channel ID
 const TARGET_CHANNEL_ID = process.env.CHANNEL_ID; 
 
-const startTime = "9:00:00";
-const endTime = "15:00:00";
-
 
 
 let menuItems = [];
 let pollMessage = null;
 let votes = {};
-let userVotes = {};
 
 
+const startTime = "9:00:00";
+const endTime = "15:00:00";
 
 // Google Sheets authentication
 const auth = new google.auth.GoogleAuth({
@@ -39,6 +38,140 @@ const auth = new google.auth.GoogleAuth({
 });
 
 const sheets = google.sheets({ version: "v4", auth });
+
+
+
+// Function to list all members in the "Members List" sheet
+async function listAllMembers(guild) {
+  const members = await guild.members.fetch();
+
+  const memberData = members
+    .filter(member => !member.user.bot)  
+    .map(member => [member.user.id, member.displayName || ""]);
+
+  const sheetName = "Members List";
+
+  try {
+    const getSheets = await sheets.spreadsheets.get({
+      spreadsheetId: process.env.SPREADSHEET_ID,
+    });
+
+    const sheetExists = getSheets.data.sheets.some(
+      (sheet) => sheet.properties.title === sheetName
+    );
+
+    if (!sheetExists) {
+      // Create the sheet if it doesn't exist
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: process.env.SPREADSHEET_ID,
+        resource: {
+          requests: [
+            {
+              addSheet: {
+                properties: {
+                  title: sheetName,
+                },
+              },
+            },
+          ],
+        },
+      });
+
+      console.log(`Created sheet: ${sheetName}`);
+    }
+
+    // Clear the current sheet contents
+    await sheets.spreadsheets.values.clear({
+      spreadsheetId: process.env.SPREADSHEET_ID,
+      range: `${sheetName}!A:B`,
+    });
+
+    // Insert member data into the sheet
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: process.env.SPREADSHEET_ID,
+      range: `${sheetName}!A1:B`,  // Adjusted the range here
+      valueInputOption: "USER_ENTERED",
+      resource: {
+        values: [["User ID", "Display Name"], ...memberData],
+      },
+    });
+
+    console.log(`Member list updated in sheet: ${sheetName}`);
+  } catch (error) {
+    console.error("Error listing all members:", error);
+  }
+}
+
+// Function to add a new member to the sheet
+async function addMemberToSheet(member) {
+  const sheetName = "Members List";
+  const userId = member.user.id;
+  const displayName = member.displayName || "";
+
+  try {
+    // Append the new member to the sheet
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: process.env.SPREADSHEET_ID,
+      range: `${sheetName}!A:B`,
+      valueInputOption: "USER_ENTERED",
+      resource: {
+        values: [[userId, displayName]],
+      },
+    });
+
+    console.log(`Added new member to sheet: ${userId}, ${displayName}`);
+  } catch (error) {
+    console.error("Error adding new member to sheet:", error);
+  }
+}
+
+// Function to remove a departing member from the sheet
+async function removeMemberFromSheet(member) {
+  const sheetName = "Members List";
+  const userId = member.user.id;
+
+  try {
+    // Get the current data from the sheet
+    const getRows = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.SPREADSHEET_ID,
+      range: `${sheetName}!A:B`,
+    });
+
+    const rows = getRows.data.values || [];
+
+    const rowIndex = rows.findIndex(row => row[0] === userId);
+
+    if (rowIndex !== -1) {
+      // Remove the row of the departing member
+      rows.splice(rowIndex, 1);
+
+      // Clear the sheet
+      await sheets.spreadsheets.values.clear({
+        spreadsheetId: process.env.SPREADSHEET_ID,
+        range: `${sheetName}!A:B`,
+      });
+
+      // Update the sheet with the remaining data
+      if (rows.length > 0) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: process.env.SPREADSHEET_ID,
+          range: `${sheetName}!A1`,
+          valueInputOption: "USER_ENTERED",
+          resource: {
+            values: rows,
+          },
+        });
+      }
+
+      console.log(`Removed member from sheet: ${userId}`);
+    } else {
+      console.log(`Member not found in sheet: ${userId}`);
+    }
+  } catch (error) {
+    console.error("Error removing member from sheet:", error);
+  }
+}
+
 
 // Function to read items from the spreadsheet (Sheet1)
 async function readSpreadsheet() {
@@ -105,7 +238,7 @@ async function createSheetIfNotExists(dateFormatted) {
         range: `${dateFormatted}!A1:D1`,
         valueInputOption: "USER_ENTERED",
         resource: {
-          values: [["User ID", "Timestamp", "Username", "Item Voted"]],
+          values: [["User ID", "Timestamp", "Display Name", "Item Voted"]],
         },
       });
 
@@ -186,94 +319,13 @@ async function createPoll(message) {
   });
 }
 
-
-async function cancelOrder(message) {
-  const userId = message.author.id;
-  const userName = message.author.username;
-  const now = new Date();
-  const currentDate = getCurrentDateFormatted(now);
-
-  // Calculate which sheet to use based on the current time
-  const startDate = new Date(now);
-  startDate.setHours(startTime.split(":")[0]);
-  startDate.setMinutes(startTime.split(":")[1]);
-  startDate.setSeconds(startTime.split(":")[2]);
-
-  const endDate = new Date(now);
-  endDate.setHours(endTime.split(":")[0]);
-  endDate.setMinutes(endTime.split(":")[1]);
-  endDate.setSeconds(endTime.split(":")[2]);
-
-  let sheetName;
-  
-  if (now < startDate) {
-    sheetName = currentDate;
-  } else if (now > endDate) {
-    const tomorrow = new Date(now);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    sheetName = getCurrentDateFormatted(tomorrow);
-  } else {
-    await message.reply("Cannot cancel between 9:00 AM and 3:00 PM.");
-    return;
-  }
-
-  try {
-    const getRows = await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.SPREADSHEET_ID,
-      range: `${sheetName}!A:D`,
-    });
-
-    const rows = getRows.data.values;
-
-    if (!rows || rows.length === 0) {
-      await message.reply("No orders found to cancel.");
-      return;
-    }
-
-    const rowIndex = rows.findIndex(row => row[0] === userId);
-
-    if (rowIndex === -1) {
-      await message.reply("You have not placed an order yet.");
-    } else {
-      rows.splice(rowIndex, 1); // Remove the matching row
-      
-      // Clear the current sheet
-      await sheets.spreadsheets.values.clear({
-        spreadsheetId: process.env.SPREADSHEET_ID,
-        range: `${sheetName}!A:D`,
-      });
-
-      // Update the sheet with the modified data
-      if (rows.length > 0) {
-        await sheets.spreadsheets.values.update({
-          spreadsheetId: process.env.SPREADSHEET_ID,
-          range: `${sheetName}!A1`,
-          valueInputOption: "RAW",
-          resource: {
-            values: rows,
-          },
-        });
-      }
-      
-      await message.reply("Your order has been canceled.");
-    }
-  } catch (error) {
-    console.error("Error canceling order:", error);
-    await message.reply("An error occurred while attempting to cancel your order.");
-  }
-}
-
-
-
 // Function to update or append the vote in the sheet
-async function updateOrAppendVote(interaction, userId, userName, itemName) {
+async function updateOrAppendVote(interaction, userId, displayName, itemName) {
   const now = new Date(); // Always represents the current date/time
   const currentDate = getCurrentDateFormatted(now);
   const tomorrow = new Date(now); // Create a copy of the current date
   tomorrow.setDate(tomorrow.getDate() + 1);
   const tomorrowDate = getCurrentDateFormatted(tomorrow);
-
-  
 
   const startDate = new Date(now);
   startDate.setHours(startTime.split(":")[0]);
@@ -334,7 +386,7 @@ async function updateOrAppendVote(interaction, userId, userName, itemName) {
         range: `${sheetName}!B${rowIndex}:D${rowIndex}`,
         valueInputOption: "USER_ENTERED",
         resource: {
-          values: [[timestamp, userName, itemName]],
+          values: [[timestamp, displayName, itemName]],
         },
       });
       console.log(`Updated existing vote for UserID: ${userId}`);
@@ -344,7 +396,7 @@ async function updateOrAppendVote(interaction, userId, userName, itemName) {
         range: `${sheetName}!A:D`,
         valueInputOption: "USER_ENTERED",
         resource: {
-          values: [[userId, timestamp, userName, itemName]],
+          values: [[userId, timestamp, displayName, itemName]],
         },
       });
       console.log(`Appended new vote for UserID: ${userId}`);
@@ -358,8 +410,15 @@ async function updateOrAppendVote(interaction, userId, userName, itemName) {
 }
 
 // Discord bot setup
-client.once("ready", () => {
+client.once("ready", async() => {
   console.log("Bot is online!");
+
+  // List all members in the "Members List" sheet when the bot starts
+  const guild = client.guilds.cache.get(process.env.GUILD_ID);
+  if (guild) {
+    await listAllMembers(guild);
+  }
+
 });
 
 // Handle text-based commands
@@ -381,12 +440,6 @@ client.on("messageCreate", async (message) => {
     await readSpreadsheet();
     await createPoll(message);
   }
-
-
-  if (message.content.toLowerCase() === "!cancel") {
-    await cancelOrder(message);
-  }
-
 });
 
 // Handle button clicks for voting
@@ -394,7 +447,11 @@ client.on("interactionCreate", async (interaction) => {
   if (!interaction.isButton()) return;
 
   const userId = interaction.user.id;
-  const userName = interaction.user.username;
+  
+  // Retrieve the GuildMember object to get the displayName
+  const guildMember = interaction.guild.members.cache.get(userId);
+  const displayName = guildMember ? guildMember.displayName : interaction.user.username;
+
   const buttonId = interaction.customId;
   const itemIndex = parseInt(buttonId.split("_")[1]);
   const itemName = menuItems[itemIndex][1];
@@ -402,8 +459,18 @@ client.on("interactionCreate", async (interaction) => {
   // Defer the reply to give you more time
   await interaction.deferReply({ ephemeral: true });
 
-  await updateOrAppendVote(interaction, userId, userName, itemName);
+  await updateOrAppendVote(interaction, userId, displayName, itemName);
+});
 
+
+// Listen for new members joining
+client.on("guildMemberAdd", async (member) => {
+  await addMemberToSheet(member);
+});
+
+// Listen for members leaving
+client.on("guildMemberRemove", async (member) => {
+  await removeMemberFromSheet(member);
 });
 
 
