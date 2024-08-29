@@ -29,7 +29,7 @@ let votes = {};
 
 
 const startTime = "9:00:00";
-const endTime = "15:00:00";
+const endTime = "12:00:00";
 
 // Google Sheets authentication
 const auth = new google.auth.GoogleAuth({
@@ -309,15 +309,24 @@ async function createPoll(message) {
       new ButtonBuilder()
         .setCustomId(`item_${index}`)
         .setLabel(item[1])
-        .setStyle(ButtonStyle.Primary)
+        .setStyle(ButtonStyle.Primary) // Blue buttons for menu items
     );
   });
+
+  // Add the red Cancel button
+  row.addComponents(
+    new ButtonBuilder()
+      .setCustomId('cancel_order')
+      .setLabel('Cancel Order')
+      .setStyle(ButtonStyle.Danger) // Red button for cancel
+  );
 
   pollMessage = await message.reply({
     content: "Today's Menu:",
     components: [row],
   });
 }
+
 
 // Function to update or append the vote in the sheet
 async function updateOrAppendVote(interaction, userId, displayName, itemName) {
@@ -339,15 +348,14 @@ async function updateOrAppendVote(interaction, userId, displayName, itemName) {
 
   let sheetName;
 
-
   console.log(now, "\n", startDate, "\n", endDate);
 
-  if (now < startDate) {
-    // If current time is before 9:00 AM, update today's sheet
-    sheetName = await createSheetIfNotExists(currentDate);
-  } else if (now > endDate) {
-    // If current time is after 7:00 PM, update tomorrow's sheet
+  if (now > endDate && now.getHours() < 24) {
+    // If current time is between 3:00 PM and 11:59:59 PM, record in tomorrow's sheet
     sheetName = await createSheetIfNotExists(tomorrowDate);
+  } else if (now < startDate || now.getHours() < 9) {
+    // If current time is between 12:00 AM and 8:59:59 AM, record in today's sheet
+    sheetName = await createSheetIfNotExists(currentDate);
   } else {
     // If current time is between 9:00 AM and 3:00 PM, disallow voting
     console.log(`Voting timestamp between 9 AM and 3 PM; voting not allowed.`);
@@ -409,8 +417,89 @@ async function updateOrAppendVote(interaction, userId, displayName, itemName) {
   }
 }
 
+
+async function cancelOrder(interaction) {
+  const userId = interaction.user.id;
+  const userName = interaction.user.username;
+  const now = new Date();
+  const currentDate = getCurrentDateFormatted(now);
+  const tomorrow = new Date(now);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const tomorrowDate = getCurrentDateFormatted(tomorrow);
+
+  const startDate = new Date(now);
+  startDate.setHours(startTime.split(":")[0]);
+  startDate.setMinutes(startTime.split(":")[1]);
+  startDate.setSeconds(startTime.split(":")[2]);
+
+  const endDate = new Date(now);
+  endDate.setHours(endTime.split(":")[0]);
+  endDate.setMinutes(endTime.split(":")[1]);
+  endDate.setSeconds(endTime.split(":")[2]);
+
+  let sheetName;
+
+  if (now > endDate && now.getHours() < 24) {
+    // If current time is between 3:00 PM and 11:59:59 PM, use tomorrow's sheet
+    sheetName = tomorrowDate;
+  } else if (now < startDate || now.getHours() < 9) {
+    // If current time is between 12:00 AM and 8:59:59 AM, use today's sheet
+    sheetName = currentDate;
+  } else {
+    await interaction.editReply("Cannot cancel between 9:00 AM and 3:00 PM.");
+    return;
+  }
+
+  try {
+    const getRows = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.SPREADSHEET_ID,
+      range: `${sheetName}!A:D`,
+    });
+
+    const rows = getRows.data.values || [];
+
+    if (!rows || rows.length === 0) {
+      await interaction.editReply("No orders found to cancel.");
+      return;
+    }
+
+    const rowIndex = rows.findIndex(row => row[0] === userId);
+
+    if (rowIndex === -1) {
+      await interaction.editReply("You have not placed an order yet.");
+    } else {
+      rows.splice(rowIndex, 1); // Remove the matching row
+
+      // Clear the current sheet
+      await sheets.spreadsheets.values.clear({
+        spreadsheetId: process.env.SPREADSHEET_ID,
+        range: `${sheetName}!A:D`,
+      });
+
+      // Update the sheet with the modified data
+      if (rows.length > 0) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: process.env.SPREADSHEET_ID,
+          range: `${sheetName}!A1`,
+          valueInputOption: "RAW",
+          resource: {
+            values: rows,
+          },
+        });
+      }
+
+      await interaction.editReply("Your order has been canceled.");
+    }
+  } catch (error) {
+    console.error("Error canceling order:", error);
+    await interaction.editReply("An error occurred while attempting to cancel your order.");
+  }
+}
+
+
+
 // Discord bot setup
-client.once("ready", async() => {
+client.once("ready", async () => {
   console.log("Bot is online!");
 
   // List all members in the "Members List" sheet when the bot starts
@@ -419,6 +508,14 @@ client.once("ready", async() => {
     await listAllMembers(guild);
   }
 
+  // Send the poll message in the designated channel
+  const channel = await client.channels.fetch(TARGET_CHANNEL_ID);
+  if (channel) {
+    await readSpreadsheet();
+    await createPoll({ reply: (content) => channel.send(content) });
+  } else {
+    console.error("Could not find the target channel.");
+  }
 });
 
 // Handle text-based commands
@@ -448,7 +545,14 @@ client.on("interactionCreate", async (interaction) => {
 
   const userId = interaction.user.id;
   
-  // Retrieve the GuildMember object to get the displayName
+  // If the cancel button is clicked
+  if (interaction.customId === 'cancel_order') {
+    await interaction.deferReply({ ephemeral: true });
+    await cancelOrder(interaction);
+    return;
+  }
+
+  // Handle voting buttons
   const guildMember = interaction.guild.members.cache.get(userId);
   const displayName = guildMember ? guildMember.displayName : interaction.user.username;
 
@@ -461,6 +565,9 @@ client.on("interactionCreate", async (interaction) => {
 
   await updateOrAppendVote(interaction, userId, displayName, itemName);
 });
+
+
+
 
 
 // Listen for new members joining
