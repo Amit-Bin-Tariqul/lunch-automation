@@ -1,4 +1,5 @@
 const { google } = require("googleapis");
+const { Worker } = require('worker_threads');
 const {
   Client,
   GatewayIntentBits,
@@ -17,19 +18,18 @@ const client = new Client({
   ],
 });
 
-
 // Replace with your channel ID
 const TARGET_CHANNEL_ID = process.env.CHANNEL_ID; 
 
 
+const startTime = "09:00:00";
+const endTime = "15:07:00";
 
 let menuItems = [];
 let pollMessage = null;
 let votes = {};
 
-
-const startTime = "9:00:00";
-const endTime = "12:00:00";
+let votingEnabled = true;
 
 // Google Sheets authentication
 const auth = new google.auth.GoogleAuth({
@@ -39,7 +39,52 @@ const auth = new google.auth.GoogleAuth({
 
 const sheets = google.sheets({ version: "v4", auth });
 
+// Function to update the poll buttons when voting is enabled/disabled
+async function updatePollButtons() {
+  if (!pollMessage) return;
 
+  const row = new ActionRowBuilder();
+
+  menuItems.forEach((item, index) => {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`item_${index}`)
+        .setLabel(item[1])
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(!votingEnabled) // Disable buttons based on the flag
+    );
+  });
+
+  row.addComponents(
+    new ButtonBuilder()
+      .setCustomId('cancel_order')
+      .setLabel('Cancel Order')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(!votingEnabled) // Disable buttons based on the flag
+  );
+
+  try {
+    await pollMessage.edit({ components: [row] });
+    console.log("Poll buttons updated based on voting status.");
+  } catch (error) {
+    console.error("Error updating poll buttons:", error);
+  }
+}
+
+// Worker setup to handle voting status
+const worker = new Worker('./pollWorker.js');
+
+worker.on('message', (message) => {
+  if (message.action === 'disableVoting') {
+    votingEnabled = false;
+    updatePollButtons();
+    console.log('Voting has been disabled.');
+  } else if (message.action === 'enableVoting') {
+    votingEnabled = true;
+    updatePollButtons();
+    console.log('Voting has been enabled.');
+  }
+});
 
 // Function to list all members in the "Members List" sheet
 async function listAllMembers(guild) {
@@ -171,7 +216,6 @@ async function removeMemberFromSheet(member) {
     console.error("Error removing member from sheet:", error);
   }
 }
-
 
 // Function to read items from the spreadsheet (Sheet1)
 async function readSpreadsheet() {
@@ -310,6 +354,7 @@ async function createPoll(message) {
         .setCustomId(`item_${index}`)
         .setLabel(item[1])
         .setStyle(ButtonStyle.Primary) // Blue buttons for menu items
+        .setDisabled(!votingEnabled)   // Disable button if voting is disabled
     );
   });
 
@@ -318,7 +363,8 @@ async function createPoll(message) {
     new ButtonBuilder()
       .setCustomId('cancel_order')
       .setLabel('Cancel Order')
-      .setStyle(ButtonStyle.Danger) // Red button for cancel
+      .setStyle(ButtonStyle.Danger)   // Red button for cancel
+      .setDisabled(!votingEnabled)    // Disable button if voting is disabled
   );
 
   pollMessage = await message.reply({
@@ -326,7 +372,6 @@ async function createPoll(message) {
     components: [row],
   });
 }
-
 
 // Function to update or append the vote in the sheet
 async function updateOrAppendVote(interaction, userId, displayName, itemName) {
@@ -350,7 +395,13 @@ async function updateOrAppendVote(interaction, userId, displayName, itemName) {
 
   console.log(now, "\n", startDate, "\n", endDate);
 
-  if (now > endDate && now.getHours() < 24) {
+  // Handling votes on Friday after 15:00:00
+  if (now.getDay() === 5 && now > endDate) { // 5 is the index for Friday
+    const nextMonday = new Date(now);
+    nextMonday.setDate(nextMonday.getDate() + ((1 + 7 - nextMonday.getDay()) % 7)); // Ensures it's always the next Monday
+    const nextMondayDate = getCurrentDateFormatted(nextMonday);
+    sheetName = await createSheetIfNotExists(nextMondayDate);
+  } else if (now > endDate && now.getHours() < 24) {
     // If current time is between 3:00 PM and 11:59:59 PM, record in tomorrow's sheet
     sheetName = await createSheetIfNotExists(tomorrowDate);
   } else if (now < startDate || now.getHours() < 9) {
@@ -416,7 +467,6 @@ async function updateOrAppendVote(interaction, userId, displayName, itemName) {
     console.error("Error updating or appending vote:", error);
   }
 }
-
 
 async function cancelOrder(interaction) {
   const userId = interaction.user.id;
@@ -496,8 +546,6 @@ async function cancelOrder(interaction) {
   }
 }
 
-
-
 // Discord bot setup
 client.once("ready", async () => {
   console.log("Bot is online!");
@@ -552,6 +600,14 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
+  if (!votingEnabled) {
+    await interaction.reply({
+      content: 'Voting is disabled from 9:00 AM to 3:00 PM. Please try again later.',
+      ephemeral: true
+    });
+    return;
+  }
+
   // Handle voting buttons
   const guildMember = interaction.guild.members.cache.get(userId);
   const displayName = guildMember ? guildMember.displayName : interaction.user.username;
@@ -566,10 +622,6 @@ client.on("interactionCreate", async (interaction) => {
   await updateOrAppendVote(interaction, userId, displayName, itemName);
 });
 
-
-
-
-
 // Listen for new members joining
 client.on("guildMemberAdd", async (member) => {
   await addMemberToSheet(member);
@@ -579,6 +631,5 @@ client.on("guildMemberAdd", async (member) => {
 client.on("guildMemberRemove", async (member) => {
   await removeMemberFromSheet(member);
 });
-
 
 client.login(process.env.DISCORD_BOT_TOKEN);
